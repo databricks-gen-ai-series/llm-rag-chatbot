@@ -145,10 +145,6 @@ monitor = dbutils.notebook.run("./05-Inference-Tables-Analysis-Notebook-with-LLM
 
 # COMMAND ----------
 
-json.loads(monitor)
-
-# COMMAND ----------
-
 url = f'https://{spark.conf.get("spark.databricks.workspaceUrl")}/sql/dashboards/{json.loads(monitor)["dashboard_id"]}'
 print(f"You can monitor the performance of your chatbot at {url}")
 
