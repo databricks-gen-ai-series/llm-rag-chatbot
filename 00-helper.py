@@ -1,115 +1,6 @@
 # Databricks notebook source
-# MAGIC %md 
-# MAGIC # init notebook setting up the backend. 
-# MAGIC
-# MAGIC Do not edit the notebook, it contains import and helpers for the demo
-# MAGIC
-# MAGIC <!-- Collect usage data (view). Remove it to disable collection or disable tracker during installation. View README for more details.  -->
-# MAGIC <img width="1px" src="https://ppxrzfxige.execute-api.us-west-2.amazonaws.com/v1/analytics?category=data-science&org_id=1444828305810485&notebook=%2F_resources%2F00-init&demo_name=llm-rag-chatbot&event=VIEW&path=%2F_dbdemos%2Fdata-science%2Fllm-rag-chatbot%2F_resources%2F00-init&version=1">
-
-# COMMAND ----------
-
-# MAGIC %pip install mlflow==2.10.1 lxml==4.9.3 transformers==4.30.2 langchain==0.1.5 databricks-vectorsearch==0.22
-# MAGIC dbutils.library.restartPython()
-
-# COMMAND ----------
-
-# MAGIC %run ../config
-
-# COMMAND ----------
-
-
-dbutils.widgets.text("reset_all_data", "false", "Reset Data")
-reset_all_data = dbutils.widgets.get("reset_all_data") == "true"
-
-# COMMAND ----------
-
-from pyspark.sql.functions import pandas_udf
-import pandas as pd
-import pyspark.sql.functions as F
-from pyspark.sql.functions import col, udf, length, pandas_udf
-import os
-import mlflow
-from typing import Iterator
-from mlflow import MlflowClient
-
-# COMMAND ----------
-
-import re
-min_required_version = "11.3"
-version_tag = spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion")
-version_search = re.search('^([0-9]*\.[0-9]*)', version_tag)
-assert version_search, f"The Databricks version can't be extracted from {version_tag}, shouldn't happen, please correct the regex"
-current_version = float(version_search.group(1))
-assert float(current_version) >= float(min_required_version), f'The Databricks version of the cluster must be >= {min_required_version}. Current version detected: {current_version}'
-
-# COMMAND ----------
-
-if reset_all_data:
-  print(f'clearing up db {dbName}')
-  spark.sql(f"DROP DATABASE IF EXISTS `{dbName}` CASCADE")
-
-# COMMAND ----------
-
-def use_and_create_db(catalog, dbName, cloud_storage_path = None):
-  print(f"USE CATALOG `{catalog}`")
-  spark.sql(f"USE CATALOG `{catalog}`")
-  spark.sql(f"""create database if not exists `{dbName}` """)
-
-assert catalog not in ['hive_metastore', 'spark_catalog']
-#If the catalog is defined, we force it to the given value and throw exception if not.
-if len(catalog) > 0:
-  current_catalog = spark.sql("select current_catalog()").collect()[0]['current_catalog()']
-  if current_catalog != catalog:
-    catalogs = [r['catalog'] for r in spark.sql("SHOW CATALOGS").collect()]
-    if catalog not in catalogs:
-      spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
-      if catalog == 'dbdemos':
-        spark.sql(f"ALTER CATALOG {catalog} OWNER TO `account users`")
-  use_and_create_db(catalog, dbName)
-
-if catalog == 'dbdemos':
-  try:
-    spark.sql(f"GRANT CREATE, USAGE on DATABASE {catalog}.{dbName} TO `account users`")
-    spark.sql(f"ALTER SCHEMA {catalog}.{dbName} OWNER TO `account users`")
-  except Exception as e:
-    print("Couldn't grant access to the schema to all users:"+str(e))    
-
-print(f"using catalog.database `{catalog}`.`{dbName}`")
-spark.sql(f"""USE `{catalog}`.`{dbName}`""")    
-
-# COMMAND ----------
-
-# DBTITLE 1,Optional: Allowing Model Serving IPs
-#If your workspace has ip access list, you need to allow your model serving endpoint to hit your AI gateway. Based on your region, IPs might change. Please reach out your Databrics Account team for more details.
-
-# def allow_serverless_ip():
-#   base_url =dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().get(),
-#   headers = {"Authorization": f"Bearer {<Your PAT Token>}", "Content-Type": "application/json"}
-#   return requests.post(f"{base_url}/api/2.0/ip-access-lists", json={"label": "serverless-model-serving", "list_type": "ALLOW", "ip_addresses": ["<IP RANGE>"], "enabled": "true"}, headers = headers).json()
-
-# COMMAND ----------
-
-# MAGIC %md 
-# MAGIC
-# MAGIC ## Helpers to get catalog and index status:
-
-# COMMAND ----------
-
-# Helper function
-def get_latest_model_version(model_name):
-    mlflow_client = MlflowClient(registry_uri="databricks-uc")
-    latest_version = 1
-    for mv in mlflow_client.search_model_versions(f"name='{model_name}'"):
-        version_int = int(mv.version)
-        if version_int > latest_version:
-            latest_version = version_int
-    return latest_version
-
-# COMMAND ----------
-
-# DBTITLE 1,endpoint
 import time
+import pandas as pd
 
 def endpoint_exists(vsc, vs_endpoint_name):
   try:
@@ -144,9 +35,31 @@ def wait_for_vs_endpoint_to_be_ready(vsc, vs_endpoint_name):
       raise Exception(f'''Error with the endpoint {vs_endpoint_name}. - this shouldn't happen: {endpoint}.\n Please delete it and re-run the previous cell: vsc.delete_endpoint("{vs_endpoint_name}")''')
   raise Exception(f"Timeout, your endpoint isn't ready yet: {vsc.get_endpoint(vs_endpoint_name)}")
 
+
+def wait_for_model_serving_endpoint_to_be_ready(ep_name):
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.serving import EndpointStateReady, EndpointStateConfigUpdate
+    import time
+
+    # TODO make the endpoint name as a param
+    # Wait for it to be ready
+    w = WorkspaceClient()
+    state = ""
+    for i in range(200):
+        state = w.serving_endpoints.get(ep_name).state
+        if state.config_update == EndpointStateConfigUpdate.IN_PROGRESS:
+            if i % 40 == 0:
+                print(f"Waiting for endpoint to deploy {ep_name}. Current state: {state}")
+            time.sleep(10)
+        elif state.ready == EndpointStateReady.READY:
+          print('endpoint ready.')
+          return
+        else:
+          break
+    raise Exception(f"Couldn't start the endpoint, timeout, please check your endpoint for more details: {state}")
+
 # COMMAND ----------
 
-# DBTITLE 1,index
 def index_exists(vsc, endpoint_name, index_full_name):
     try:
         vsc.get_index(endpoint_name, index_full_name).describe()
@@ -177,101 +90,39 @@ def wait_for_index_to_be_ready(vsc, vs_endpoint_name, index_name):
 
 # COMMAND ----------
 
-import requests
-from bs4 import BeautifulSoup
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
-from pyspark.sql.types import StringType
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-#Add retries with backoff to avoid 429 while fetching the doc
-retries = Retry(
-    total=3,
-    backoff_factor=3,
-    status_forcelist=[429],
-)
-
-def download_databricks_documentation_articles(max_documents=None):
-    # Fetch the XML content from sitemap
-    response = requests.get(DATABRICKS_SITEMAP_URL)
-    root = ET.fromstring(response.content)
-
-    # Find all 'loc' elements (URLs) in the XML
-    urls = [loc.text for loc in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
-    if max_documents:
-        urls = urls[:max_documents]
-
-    # Create DataFrame from URLs
-    df_urls = spark.createDataFrame(urls, StringType()).toDF("url").repartition(10)
-
-    # Pandas UDF to fetch HTML content for a batch of URLs
-    @pandas_udf("string")
-    def fetch_html_udf(urls: pd.Series) -> pd.Series:
-        adapter = HTTPAdapter(max_retries=retries)
-        http = requests.Session()
-        http.mount("http://", adapter)
-        http.mount("https://", adapter)
-        def fetch_html(url):
-            try:
-                response = http.get(url)
-                if response.status_code == 200:
-                    return response.content
-            except requests.RequestException:
-                return None
-            return None
-
-        with ThreadPoolExecutor(max_workers=200) as executor:
-            results = list(executor.map(fetch_html, urls))
-        return pd.Series(results)
-
-    # Pandas UDF to process HTML content and extract text
-    @pandas_udf("string")
-    def download_web_page_udf(html_contents: pd.Series) -> pd.Series:
-        def extract_text(html_content):
-            if html_content:
-                soup = BeautifulSoup(html_content, "html.parser")
-                article_div = soup.find("div", itemprop="articleBody")
-                if article_div:
-                    return str(article_div).strip()
-            return None
-
-        return html_contents.apply(extract_text)
-
-    # Apply UDFs to DataFrame
-    df_with_html = df_urls.withColumn("html_content", fetch_html_udf("url"))
-    final_df = df_with_html.withColumn("text", download_web_page_udf("html_content"))
-
-    # Select and filter non-null results
-    final_df = final_df.select("url", "text").filter("text IS NOT NULL").cache()
-    if final_df.isEmpty():
-      raise Exception("Dataframe is empty, couldn't download Databricks documentation, please check sitemap status.")
-
-    return final_df
+#install poppler on the cluster
+def install_ocr_on_nodes():
+    """
+    install poppler on the cluster (should be done by init scripts)
+    """
+    # from pyspark.sql import SparkSession
+    import subprocess
+    num_workers = max(1,int(spark.conf.get("spark.databricks.clusterUsageTags.clusterWorkers")))
+    command = "sudo rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && sudo apt-get purge && sudo apt-get clean && sudo apt-get update && sudo apt-get install poppler-utils tesseract-ocr -y" 
+    def run_subprocess(command):
+        try:
+            output = subprocess.check_output(command, stderr=subprocess.STDOUT, shell=True)
+            return output.decode()
+        except subprocess.CalledProcessError as e:
+            raise Exception("An error occurred installing OCR libs:"+ e.output.decode())
+    #install on the driver
+    run_subprocess(command)
+    def run_command(iterator):
+        for x in iterator:
+            yield run_subprocess(command)
+    # spark = SparkSession.builder.getOrCreate()
+    data = spark.sparkContext.parallelize(range(num_workers), num_workers) 
+    # Use mapPartitions to run command in each partition (worker)
+    output = data.mapPartitions(run_command)
+    try:
+        output.collect();
+        print("OCR libraries installed")
+    except Exception as e:
+        print(f"Couldn't install on all node: {e}")
+        raise e
 
 # COMMAND ----------
 
-def display_gradio_app(space_name = "databricks-demos-chatbot"):
-    displayHTML(f'''<div style="margin: auto; width: 1000px"><iframe src="https://{space_name}.hf.space" frameborder="0" width="1000" height="950" style="margin: auto"></iframe></div>''')
-
-# COMMAND ----------
-
-# DBTITLE 1,Cleanup utility to remove demo assets
-def cleanup_demo(catalog, db, serving_endpoint_name, vs_index_fullname):
-  vsc = VectorSearchClient()
-  try:
-    vsc.delete_index(endpoint_name = VECTOR_SEARCH_ENDPOINT_NAME, index_name=vs_index_fullname)
-  except Exception as e:
-    print(f"can't delete index {VECTOR_SEARCH_ENDPOINT_NAME} {vs_index_fullname} - might not be existing: {e}")
-  try:
-    WorkspaceClient().serving_endpoints.delete(serving_endpoint_name)
-  except Exception as e:
-    print(f"can't delete serving endpoint {serving_endpoint_name} - might not be existing: {e}")
-  spark.sql(f'DROP SCHEMA `{catalog}`.`{db}` CASCADE')
-
-# COMMAND ----------
-
-# DBTITLE 1,Demo helper to debug permission issue
 def test_demo_permissions(host, secret_scope, secret_key, vs_endpoint_name, index_name, embedding_endpoint_name = None, managed_embeddings = True):
   error = False
   CSS_REPORT = """
@@ -426,16 +277,66 @@ def test_demo_permissions(host, secret_scope, secret_key, vs_endpoint_name, inde
 
 # COMMAND ----------
 
-def pprint(obj):
-  import pprint
-  pprint.pprint(obj, compact=True, indent=1, width=100)
+def display_chat(chat_history, response):
+  def user_message_html(message):
+    return f"""
+      <div style="width: 90%; border-radius: 10px; background-color: #c2efff; padding: 10px; box-shadow: 2px 2px 2px #F7f7f7; margin-bottom: 10px; font-size: 14px;">
+        {message}
+      </div>"""
+  def assistant_message_html(message):
+    return f"""
+      <div style="width: 90%; border-radius: 10px; background-color: #e3f6fc; padding: 10px; box-shadow: 2px 2px 2px #F7f7f7; margin-bottom: 10px; margin-left: 40px; font-size: 14px">
+        <img style="float: left; width:40px; margin: -10px 5px 0px -10px" src="https://github.com/databricks-demos/dbdemos-resources/blob/main/images/product/chatbot-rag/robot.png?raw=true"/>
+        {message}
+      </div>"""
+  chat_history_html = "".join([user_message_html(m["content"]) if m["role"] == "user" else assistant_message_html(m["content"]) for m in chat_history])
+  answer = response["result"].replace('\n', '<br/>')
+  sources_html = ("<br/><br/><br/><strong>Sources:</strong><br/> <ul>" + '\n'.join([f"""<li><a href="{s}">{s}</a></li>""" for s in response["sources"]]) + "</ul>") if response["sources"] else ""
+  response_html = f"""{answer}{sources_html}"""
+
+  displayHTML(chat_history_html + assistant_message_html(response_html))
 
 # COMMAND ----------
 
-#Temp workaround to test if a table exists in shared cluster mode in DBR 14.2 (see SASP-2467)
-def table_exists(table_name):
-    try:
-        spark.table(table_name).isEmpty()
-    except:
-        return False
-    return True
+def display_txt_as_html(txt):
+    txt = txt.replace('\n', '<br/>')
+    displayHTML(f'<div style="max-height: 150px">{txt}</div>')
+
+# COMMAND ----------
+
+import requests
+import collections
+import os
+ 
+def download_file_from_git(dest, owner, repo, path):
+    def download_file(url, destination):
+      local_filename = url.split('/')[-1]
+      # NOTE the stream=True parameter below
+      with requests.get(url, stream=True) as r:
+          r.raise_for_status()
+          print('saving '+destination+'/'+local_filename)
+          with open(destination+'/'+local_filename, 'wb') as f:
+              for chunk in r.iter_content(chunk_size=8192): 
+                  # If you have chunk encoded response uncomment if
+                  # and set chunk_size parameter to None.
+                  #if chunk: 
+                  f.write(chunk)
+      return local_filename
+
+    if not os.path.exists(dest):
+      os.makedirs(dest)
+    from concurrent.futures import ThreadPoolExecutor
+    files = requests.get(f'https://api.github.com/repos/{owner}/{repo}/contents{path}').json()
+    files = [f['download_url'] for f in files if 'NOTICE' not in f['name']]
+    def download_to_dest(url):
+         download_file(url, dest)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        collections.deque(executor.map(download_to_dest, files))
+
+# COMMAND ----------
+
+def upload_pdfs_to_volume(volume_path):
+  download_file_from_git(volume_path, "databricks-demos", "dbdemos-dataset", "/llm/databricks-pdf-documentation")
+
+def upload_dataset_to_volume(volume_path):
+  download_file_from_git(volume_path, "databricks-demos", "dbdemos-dataset", "/llm/databricks-documentation")
